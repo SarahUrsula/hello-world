@@ -113,18 +113,18 @@ def notify_telegram(text: str) -> None:
 
 def send_notifications(new_slots: dict[str, list[str]]) -> None:
     """new_slots: { 'YYYY-MM': ['DD Mon YYYY', ...] }"""
-    lines = ["🏔  Otter Trail slots just opened on SANParks!\n"]
+    lines = ["Otter Trail slots just opened on SANParks!\n"]
     for month, dates in sorted(new_slots.items()):
         lines.append(f"  {month}:")
         for d in sorted(dates):
-            lines.append(f"    • {d}")
+            lines.append(f"    - {d}")
     lines.append(f"\nBook now: {TRAILS_URL}")
     message = "\n".join(lines)
 
     print(message)
     notify_desktop("Otter Trail Available!", "\n".join(lines[:6]))
-    notify_email("🏔 Otter Trail slots available!", message)
-    notify_telegram(message.replace("🏔", "").strip())
+    notify_email("Otter Trail slots available!", message)
+    notify_telegram(message)
 
 # ── Browser scraper ────────────────────────────────────────────────────────────
 
@@ -135,7 +135,7 @@ async def fetch_availability(page) -> dict[str, list[str]]:
     """
     availability: dict[str, list[str]] = {}
 
-    print(f"[scraper] Opening SANParks booking portal …")
+    print(f"[scraper] Opening SANParks booking portal ...")
     await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=60_000)
 
     # Accept any cookie/popup banners
@@ -169,7 +169,7 @@ async def fetch_availability(page) -> dict[str, list[str]]:
 
     if not booked:
         # Fall back: navigate directly to the reservations portal and search
-        print("[scraper] Could not find Book button on trail page – trying reservations portal")
+        print("[scraper] Could not find Book button on trail page - trying reservations portal")
         await page.goto(TRAILS_URL, wait_until="domcontentloaded", timeout=60_000)
 
         # Try searching for Otter Trail in their search box
@@ -189,19 +189,19 @@ async def fetch_availability(page) -> dict[str, list[str]]:
             result = page.locator("a:has-text('Otter Trail')").first
             await result.click(timeout=8_000)
         except PWTimeout:
-            print("[scraper] Could not navigate to Otter Trail page – selector may have changed")
+            print("[scraper] Could not navigate to Otter Trail page - selector may have changed")
             return availability
 
     # Wait for a calendar/date-picker to appear
     await page.wait_for_timeout(3_000)
-    print("[scraper] Looking for availability calendar …")
+    print("[scraper] Looking for availability calendar ...")
 
     # ── Month iteration ──────────────────────────────────────────────────────
     today = date.today()
     for month_offset in range(MONTHS_TO_CHECK):
         target = today + relativedelta(months=month_offset)
         month_key = target.strftime("%Y-%m")
-        print(f"[scraper] Checking {target.strftime('%B %Y')} …")
+        print(f"[scraper] Checking {target.strftime('%B %Y')} ...")
 
         # Navigate forward if not on the first month
         if month_offset > 0:
@@ -246,9 +246,9 @@ async def fetch_availability(page) -> dict[str, list[str]]:
 
         if available_in_month:
             availability[month_key] = available_in_month
-            print(f"  → {len(available_in_month)} available date(s): {available_in_month[:5]}")
+            print(f"  -> {len(available_in_month)} available date(s): {available_in_month[:5]}")
         else:
-            print(f"  → No available dates (or calendar not loaded)")
+            print(f"  -> No available dates (or calendar not loaded)")
 
     return availability
 
@@ -258,7 +258,9 @@ async def run_check() -> None:
     current: dict[str, list[str]] = {}
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=HEADLESS)
+        # --no-sandbox is required in GitHub Actions / most CI environments
+        ci_args = ["--no-sandbox", "--disable-setuid-sandbox"] if os.getenv("CI") else []
+        browser = await pw.chromium.launch(headless=HEADLESS, args=ci_args)
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=(
@@ -289,7 +291,7 @@ async def run_check() -> None:
     else:
         print(f"\n[tracker] No new slots. Checked {len(current)} month(s).")
         if not current:
-            print("[tracker] Warning: no availability data was scraped – selectors may need updating.")
+            print("[tracker] Warning: no availability data was scraped - selectors may need updating.")
 
     # Merge and save (keep months even when no availability, to track drops too)
     merged = {**previous, **current}
@@ -298,5 +300,5 @@ async def run_check() -> None:
 
 
 if __name__ == "__main__":
-    print(f"[tracker] SANParks Otter Trail checker – {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[tracker] SANParks Otter Trail checker - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     asyncio.run(run_check())
