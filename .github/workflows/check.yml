@@ -18,6 +18,8 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
+          # Use a PAT if the repo is private and you need push-back access,
+          # otherwise the default GITHUB_TOKEN is fine.
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
