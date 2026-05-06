@@ -3,3 +3,7 @@ state.json
 __pycache__/
 *.pyc
 .playwright/
+browser_profile/
+debug_*.html
+debug_*.txt
+checker.log

@@ -1,77 +1,84 @@
 # SANParks Otter Trail – Availability Tracker
 
 Watches the SANParks booking portal for Otter Trail cancellations / new slots
-and sends you a notification the moment something opens up.
+and notifies you the moment something opens up.
+
+> **Why local instead of cloud?**  SANParks sits behind Cloudflare bot
+> protection. GitHub Actions / datacenter IPs get hard-blocked. Running on
+> your own machine with a real Chrome profile gets through transparently.
 
 ## How it works
 
-1. Launches a headless Chromium browser (via Playwright) to load the
-   SANParks booking page for the Otter Trail.
-2. Navigates the availability calendar across the next **11 months**
-   (configurable via `MONTHS_TO_CHECK` in `.env`).
-3. Compares what it found against `state.json` from the previous run.
-4. If any **new** available dates appear it fires a notification via:
-   - Desktop pop-up (`notify-send`)
-   - Email (optional SMTP / Gmail App Password)
-   - Telegram bot (optional)
-5. Saves the latest availability to `state.json` so the next run only
-   alerts on genuinely new changes.
+1. Opens your installed Google Chrome via Playwright with a persistent
+   profile in `browser_profile/` — once Cloudflare trusts the profile,
+   subsequent runs sail through, even headless.
+2. Navigates `https://www.sanparks.org/reservations/overnight-activity-details/396/1/<date>`
+   for one date in each upcoming month, scraping the rendered Angular
+   calendar for days where `available-sub > 0`.
+3. Diffs against `state.json` and notifies if any **new** slots have
+   appeared since the last run.
 
-## Setup
+## One-time setup
 
-```bash
-bash setup.sh        # installs deps + Playwright Chromium browser
+```powershell
+# 1. Install deps
+pip install -r requirements.txt
+python -m playwright install chromium
+
+# 2. First run — visible browser, you may need to click "Verify you are human" once.
+$env:HEADLESS="false"; python checker.py
+
+# 3. Configure notifications (optional but recommended)
+copy .env.example .env
+notepad .env
 ```
 
-Then edit `.env` (copied from `.env.example`) with your notification details.
+## Schedule it (Windows Task Scheduler)
 
-## Running
+From an **elevated** PowerShell:
 
-```bash
-# One-off check
-python checker.py
-
-# Watch the log
-tail -f checker.log
+```powershell
+powershell -ExecutionPolicy Bypass -File schedule_task.ps1
 ```
 
-## Scheduling (cron – every 10 minutes)
+This registers a task called **"Otter Trail Checker"** that runs
+`run_checker.bat` every 10 minutes for as long as your machine is awake.
+Logs go to `checker.log`.
 
-```bash
-crontab -e
-```
+To remove later: `Unregister-ScheduledTask -TaskName "Otter Trail Checker" -Confirm:$false`
 
-Add:
-```
-*/10 * * * * cd /full/path/to/this/directory && python checker.py >> checker.log 2>&1
-```
+## Notification options (`.env`)
 
-For more frequent checks (every 5 minutes):
-```
-*/5 * * * * cd /full/path/to/this/directory && python checker.py >> checker.log 2>&1
-```
+| Variable | What it does |
+|---|---|
+| `EMAIL_ENABLED=true` + `SMTP_*` / `EMAIL_*` | Email via SMTP (Gmail App Password recommended) |
+| `TELEGRAM_ENABLED=true` + `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | Telegram bot DM |
+| (always on, Windows only) | Native Windows toast notification |
 
-## Configuration (`.env`)
+## Configuration
 
-| Variable | Default | Description |
+| Variable | Default | Notes |
 |---|---|---|
 | `MONTHS_TO_CHECK` | `11` | How many months ahead to scan |
-| `HEADLESS` | `true` | `false` shows the browser window (good for debugging) |
-| `EMAIL_ENABLED` | `false` | Set to `true` + fill SMTP fields to get emails |
-| `TELEGRAM_ENABLED` | `false` | Set to `true` + fill token/chat_id for Telegram |
-| `STATE_FILE` | `state.json` | Where availability state is persisted |
+| `HEADLESS` | `true` | `false` shows the Chrome window |
+| `STATE_FILE` | `state.json` | Where known availability is persisted |
+| `PROFILE_DIR` | `browser_profile` | Chrome user-data-dir (cookies live here) |
 
 ## Troubleshooting
 
-**"No availability data was scraped"** – SANParks may have updated their
-booking portal HTML. Run with `HEADLESS=false` in `.env` to watch what the
-browser does, then update the selectors in `checker.py` (`fetch_availability`).
+**Cloudflare keeps blocking you** — run once with `HEADLESS=false` and
+solve the "Verify you are human" challenge by hand. Once the cookies
+land in `browser_profile/`, headless runs work for hours/days.
 
-**Blocked / CAPTCHA** – Add a longer `wait_for_timeout` delay or run less
-frequently. The script already uses a realistic browser user-agent.
+**"Calendar didn't render"** — the SANParks Angular page sometimes takes
+a few seconds. The script already waits 30s; if it still fails, your
+network is slow or the site is down.
+
+**Test what's on the page** — set `HEADLESS=false` and watch the run.
 
 ## Notes
 
-- SANParks opens Otter Trail bookings 11 months in advance.
-- The trail runs 5 nights / 6 days; you book the **start date**.
-- Max group size is 12 people; groups sometimes cancel close to the date.
+- Otter Trail ID in SANParks system = **396**.
+- Bookings open ~11 months in advance.
+- Trail is 5 nights / 6 days; the *start date* is what you book.
+- Max group size is 12 — cancellations DO happen, especially close to the date.
