@@ -1,0 +1,86 @@
+name: Otter Trail Availability Checker
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub may delay by up to ~15 min under heavy load,
+    # but that's fine — we just need to catch cancellations promptly.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:   # lets you trigger a manual run from the Actions tab
+
+permissions:
+  contents: write      # needed to commit state.json back to the repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # Use a PAT if the repo is private and you need push-back access,
+          # otherwise the default GITHUB_TOKEN is fine.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Cache pip packages so installs are fast after the first run
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # Cache the Playwright browser binary (~180 MB) — saves ~45 s per run
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright Chromium
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
+
+      - name: Install Chromium system deps (cached run)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: playwright install-deps chromium
+
+      - name: Run availability checker
+        env:
+          # ── Telegram (recommended for cloud – no SMTP needed) ──────────────
+          TELEGRAM_ENABLED:    ${{ vars.TELEGRAM_ENABLED }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          # ── Email (optional) ───────────────────────────────────────────────
+          EMAIL_ENABLED:       ${{ vars.EMAIL_ENABLED }}
+          EMAIL_FROM:          ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:            ${{ secrets.EMAIL_TO }}
+          SMTP_HOST:           ${{ vars.SMTP_HOST }}
+          SMTP_PORT:           ${{ vars.SMTP_PORT }}
+          SMTP_USER:           ${{ secrets.SMTP_USER }}
+          SMTP_PASS:           ${{ secrets.SMTP_PASS }}
+          # ── Behaviour ──────────────────────────────────────────────────────
+          MONTHS_TO_CHECK:     ${{ vars.MONTHS_TO_CHECK || '11' }}
+          HEADLESS:            'true'
+        run: python checker.py
+
+      # Commit updated state.json so next run only alerts on truly new slots.
+      # [skip ci] prevents this commit from triggering another workflow run.
+      - name: Save availability state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet && echo "No state change" || (
+            git commit -m "chore: update otter trail state [skip ci]" &&
+            git pull --rebase origin ${{ github.ref_name }} &&
+            git push
+          )

@@ -258,7 +258,9 @@ async def run_check() -> None:
     current: dict[str, list[str]] = {}
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=HEADLESS)
+        # --no-sandbox is required in GitHub Actions / most CI environments
+        ci_args = ["--no-sandbox", "--disable-setuid-sandbox"] if os.getenv("CI") else []
+        browser = await pw.chromium.launch(headless=HEADLESS, args=ci_args)
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=(
