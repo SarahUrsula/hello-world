@@ -31,7 +31,7 @@ load_dotenv()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-MONTHS_TO_CHECK  = int(os.getenv("MONTHS_TO_CHECK", "11"))
+MONTHS_TO_CHECK  = int(os.getenv("MONTHS_TO_CHECK") or "11")
 HEADLESS         = os.getenv("HEADLESS", "true").lower() == "true"
 STATE_FILE       = Path(os.getenv("STATE_FILE", "state.json"))
 
@@ -39,7 +39,7 @@ EMAIL_ENABLED    = os.getenv("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_FROM       = os.getenv("EMAIL_FROM", "")
 EMAIL_TO         = os.getenv("EMAIL_TO", "")
 SMTP_HOST        = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT        = int(os.getenv("SMTP_PORT", "587"))
+SMTP_PORT        = int(os.getenv("SMTP_PORT") or "587")
 SMTP_USER        = os.getenv("SMTP_USER", "")
 SMTP_PASS        = os.getenv("SMTP_PASS", "")
 
