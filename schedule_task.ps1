@@ -20,10 +20,13 @@ $action = New-ScheduledTaskAction `
     -Execute $BatPath `
     -WorkingDirectory $ScriptDir
 
-# Build one daily trigger per run time
+# Build one daily trigger per run time, each with up to 7 minutes of random delay
+# so the checker doesn't hit SANParks at the exact same second every day.
 $runTimes = @("08:00", "08:15", "08:30", "08:45", "09:00", "09:15", "13:00", "17:00")
 $triggers = $runTimes | ForEach-Object {
-    New-ScheduledTaskTrigger -Daily -At $_
+    $t = New-ScheduledTaskTrigger -Daily -At $_
+    $t.RandomDelay = "PT7M"
+    $t
 }
 
 $settings = New-ScheduledTaskSettingsSet `
