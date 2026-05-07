@@ -1,21 +1,26 @@
 """
-SANParks Otter Trail availability tracker.
+SANParks Otter Trail availability tracker (LOCAL version).
 
-Checks the SANParks booking portal for Otter Trail openings across all
-upcoming months and sends a notification whenever new slots appear.
+The SANParks site sits behind Cloudflare bot protection, so this is built
+to run *locally* on your Windows machine with a persistent Chrome profile —
+you solve Cloudflare once and the cookies stick.
 
-Run manually:
-    python checker.py
+First run (interactive):
+    set HEADLESS=false&& python checker.py
+    -> a Chrome window opens; if you see a Cloudflare "Verify you are human"
+       prompt, click it. Once the booking page loads, the script takes over.
 
-Schedule with cron (every 10 minutes):
-    */10 * * * * cd /path/to/this/dir && python checker.py >> checker.log 2>&1
+Subsequent runs:
+    python checker.py     (headless once profile is trusted)
+
+Schedule via Windows Task Scheduler — see schedule_task.ps1.
 """
 
 import asyncio
 import json
 import os
 import smtplib
-import subprocess
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, date
@@ -34,6 +39,14 @@ load_dotenv()
 MONTHS_TO_CHECK  = int(os.getenv("MONTHS_TO_CHECK") or "11")
 HEADLESS         = os.getenv("HEADLESS", "true").lower() == "true"
 STATE_FILE       = Path(os.getenv("STATE_FILE", "state.json"))
+PROFILE_DIR      = Path(os.getenv("PROFILE_DIR", "browser_profile")).absolute()
+# When true, fires a notification on every run regardless of state diff.
+# Use for testing notification setup; switch back to false for normal use.
+FORCE_NOTIFY     = os.getenv("FORCE_NOTIFY", "false").lower() == "true"
+# When true, sends a status message on every run showing current availability,
+# even if nothing changed. Use during testing to confirm the checker is working.
+# Set to false for normal use (only notify when slots change up or down).
+STATUS_NOTIFY    = os.getenv("STATUS_NOTIFY", "false").lower() == "true"
 
 EMAIL_ENABLED    = os.getenv("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_FROM       = os.getenv("EMAIL_FROM", "")
@@ -47,13 +60,11 @@ TELEGRAM_ENABLED  = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# SANParks booking portal – Otter Trail (Tsitsikamma / Garden Route NP)
-# The trail ID in their system is 59982.  If the portal ever changes, update
-# BOOKING_URL to the new trail landing page.
-BOOKING_URL = (
-    "https://www.sanparks.org/tourism/conservation/reserves/garden_route/otter.php"
+# Otter Trail booking page. ID 396 = Otter Trail; the trailing date drives
+# which month's calendar the page renders.
+TRAIL_URL_TEMPLATE = (
+    "https://www.sanparks.org/reservations/overnight-activity-details/396/1/{date}"
 )
-TRAILS_URL  = "https://www.sanparks.org/reservations/"
 
 # ── State helpers ──────────────────────────────────────────────────────────────
 
@@ -70,12 +81,29 @@ def save_state(state: dict) -> None:
 
 # ── Notification helpers ───────────────────────────────────────────────────────
 
-def notify_desktop(title: str, body: str) -> None:
-    """Fire a desktop notification (Linux notify-send)."""
+def notify_windows_toast(title: str, body: str) -> None:
+    """Fire a Windows 10/11 toast notification via PowerShell."""
+    if os.name != "nt":
+        return
     try:
-        subprocess.run(["notify-send", "-u", "critical", title, body], check=False)
-    except FileNotFoundError:
-        pass  # notify-send not available
+        import subprocess
+        ps = (
+            "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,"
+            "ContentType=WindowsRuntime] | Out-Null;"
+            "[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,"
+            "ContentType=WindowsRuntime] | Out-Null;"
+            "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
+            "[Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+            f'$t.GetElementsByTagName("text")[0].InnerText="{title}";'
+            f'$t.GetElementsByTagName("text")[1].InnerText="{body[:200]}";'
+            "$n=[Windows.UI.Notifications.ToastNotification]::new($t);"
+            "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier"
+            "('Otter Trail Tracker').Show($n)"
+        )
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
 
 def notify_email(subject: str, body: str) -> None:
     if not EMAIL_ENABLED:
@@ -100,205 +128,205 @@ def notify_telegram(text: str) -> None:
         return
     url = (
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        f"?chat_id={TELEGRAM_CHAT_ID}&text={urllib.parse.quote(text)}&parse_mode=HTML"
+        f"?chat_id={TELEGRAM_CHAT_ID}&text={urllib.parse.quote(text)}"
     )
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310
-            if resp.status != 200:
-                print(f"[notify] Telegram HTTP {resp.status}")
-            else:
-                print("[notify] Telegram message sent")
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            print(f"[notify] Telegram HTTP {resp.status}: message sent")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:300]
+        print(f"[notify] Telegram HTTP {exc.code}: {body}")
+        if "chat not found" in body.lower():
+            print("[notify]   -> open Telegram, search for your bot, send /start to it, then retry")
+        elif "unauthorized" in body.lower():
+            print("[notify]   -> TELEGRAM_BOT_TOKEN is wrong (re-check from @BotFather)")
     except Exception as exc:
         print(f"[notify] Telegram failed: {exc}")
 
 def send_notifications(new_slots: dict[str, list[str]]) -> None:
-    """new_slots: { 'YYYY-MM': ['DD Mon YYYY', ...] }"""
     lines = ["Otter Trail slots just opened on SANParks!\n"]
     for month, dates in sorted(new_slots.items()):
         lines.append(f"  {month}:")
         for d in sorted(dates):
             lines.append(f"    - {d}")
-    lines.append(f"\nBook now: {TRAILS_URL}")
+    lines.append("\nBook now: https://www.sanparks.org/reservations")
     message = "\n".join(lines)
 
     print(message)
-    notify_desktop("Otter Trail Available!", "\n".join(lines[:6]))
+    notify_windows_toast("Otter Trail Available!", "\n".join(lines[1:5]))
     notify_email("Otter Trail slots available!", message)
     notify_telegram(message)
 
+def send_status(current: dict[str, list[str]], new_slots: dict[str, list[str]]) -> None:
+    """Send a status update showing current availability; used when STATUS_NOTIFY=true."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if new_slots:
+        lines = [f"[{ts}] NEW slots opened on SANParks Otter Trail!\n"]
+        for month, dates in sorted(new_slots.items()):
+            lines.append(f"  {month} (NEW):")
+            for d in sorted(dates):
+                lines.append(f"    + {d}")
+    else:
+        lines = [f"[{ts}] Otter Trail check — no changes.\n"]
+
+    if current:
+        lines.append("\nCurrent availability:")
+        for month, dates in sorted(current.items()):
+            lines.append(f"  {month}:")
+            for d in sorted(dates):
+                lines.append(f"    - {d}")
+    else:
+        lines.append("\nNo slots currently available.")
+
+    lines.append("\nhttps://www.sanparks.org/reservations")
+    message = "\n".join(lines)
+
+    print(message)
+    if new_slots:
+        notify_windows_toast("Otter Trail Available!", "\n".join(lines[1:5]))
+        notify_email("Otter Trail slots available!", message)
+    notify_telegram(message)
+
+# ── Cloudflare detection ──────────────────────────────────────────────────────
+
+async def is_cloudflare_challenge(page) -> bool:
+    title = (await page.title()).lower()
+    return "just a moment" in title or "checking your browser" in title
+
+async def wait_through_cloudflare(page, timeout_ms: int = 45_000) -> bool:
+    print("[scraper] Cloudflare challenge detected -- waiting for it to clear ...")
+    try:
+        await page.wait_for_function(
+            "() => !document.title.toLowerCase().includes('just a moment') "
+            "&& !document.title.toLowerCase().includes('checking your browser')",
+            timeout=timeout_ms,
+        )
+        return True
+    except PWTimeout:
+        return False
+
 # ── Browser scraper ────────────────────────────────────────────────────────────
 
-async def fetch_availability(page) -> dict[str, list[str]]:
-    """
-    Navigate the SANParks booking portal to find Otter Trail availability.
-    Returns a dict of { 'YYYY-MM': [list of available date strings] }.
-    """
-    availability: dict[str, list[str]] = {}
+async def fetch_month(page, target: date) -> list[str]:
+    url = TRAIL_URL_TEMPLATE.format(date=target.strftime("%Y-%m-%d"))
+    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
-    print(f"[scraper] Opening SANParks booking portal ...")
-    await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=60_000)
+    if await is_cloudflare_challenge(page):
+        if not await wait_through_cloudflare(page):
+            print("[scraper] Cloudflare did not clear -- run with HEADLESS=false to solve it manually")
+            return []
 
-    # Accept any cookie/popup banners
-    for selector in ["button:has-text('Accept')", "button:has-text('I Agree')",
-                     "#onetrust-accept-btn-handler", ".cc-accept"]:
-        try:
-            btn = page.locator(selector).first
-            if await btn.is_visible(timeout=3_000):
-                await btn.click()
-                break
-        except PWTimeout:
-            pass
+    # Wait for the Angular calendar to fully render
+    try:
+        await page.wait_for_selector(".schedular-table .day", timeout=30_000)
+    except PWTimeout:
+        print(f"[scraper] Calendar didn't render for {target:%B %Y}")
+        return []
 
-    # Look for the "Book Now" / "Book Trail" CTA on the Otter Trail page
-    booked = False
-    for selector in [
-        "a:has-text('Book Now')",
-        "a:has-text('Book Trail')",
-        "a:has-text('Book')",
-        "input[value*='Book']",
-        "button:has-text('Book')",
-    ]:
-        try:
-            btn = page.locator(selector).first
-            if await btn.is_visible(timeout=4_000):
-                await btn.click()
-                booked = True
-                break
-        except PWTimeout:
-            pass
+    # Verify we're looking at the expected month
+    try:
+        heading = (await page.locator(".calendar-heading strong").first.inner_text()).strip()
+    except Exception:
+        heading = "?"
+    expected = target.strftime("%B %Y")
+    if heading != expected:
+        print(f"  [warn] calendar shows {heading!r}, expected {expected!r}")
 
-    if not booked:
-        # Fall back: navigate directly to the reservations portal and search
-        print("[scraper] Could not find Book button on trail page - trying reservations portal")
-        await page.goto(TRAILS_URL, wait_until="domcontentloaded", timeout=60_000)
-
-        # Try searching for Otter Trail in their search box
-        for sel in ["input[placeholder*='Search']", "input[name*='search']",
-                    "input[type='search']", "#search"]:
-            try:
-                box = page.locator(sel).first
-                if await box.is_visible(timeout=3_000):
-                    await box.fill("Otter Trail")
-                    await box.press("Enter")
-                    break
-            except PWTimeout:
-                pass
-
-        # Click first Otter Trail result
-        try:
-            result = page.locator("a:has-text('Otter Trail')").first
-            await result.click(timeout=8_000)
-        except PWTimeout:
-            print("[scraper] Could not navigate to Otter Trail page - selector may have changed")
-            return availability
-
-    # Wait for a calendar/date-picker to appear
-    await page.wait_for_timeout(3_000)
-    print("[scraper] Looking for availability calendar ...")
-
-    # ── Month iteration ──────────────────────────────────────────────────────
-    today = date.today()
-    for month_offset in range(MONTHS_TO_CHECK):
-        target = today + relativedelta(months=month_offset)
-        month_key = target.strftime("%Y-%m")
-        print(f"[scraper] Checking {target.strftime('%B %Y')} ...")
-
-        # Navigate forward if not on the first month
-        if month_offset > 0:
-            for nav_sel in [
-                "button[aria-label*='Next']",
-                "button[aria-label*='next']",
-                "button:has-text('>')",
-                ".calendar-next",
-                ".fc-next-button",
-                "[data-action='next']",
-            ]:
-                try:
-                    btn = page.locator(nav_sel).first
-                    if await btn.is_visible(timeout=3_000):
-                        await btn.click()
-                        await page.wait_for_timeout(1_500)
-                        break
-                except PWTimeout:
-                    pass
-
-        # Extract available (enabled, not greyed-out) dates from calendar
-        available_in_month: list[str] = []
-
-        # SANParks typically renders available days as <td> or <button> with
-        # an "available" class and no "disabled" attribute.
-        for day_sel in [
-            "td.available:not(.disabled)",
-            "td[class*='available']:not([class*='disabled'])",
-            "button[class*='available']:not([disabled])",
-            ".day.available",
-            "[aria-disabled='false']:not(.blocked)",
-            "td:not(.disabled):not(.blocked):not(.past) a",
-        ]:
-            day_els = await page.locator(day_sel).all()
-            if day_els:
-                for el in day_els:
-                    label = await el.get_attribute("aria-label") or await el.inner_text()
-                    label = label.strip()
-                    if label:
-                        available_in_month.append(label)
-                break  # found the right selector
-
-        if available_in_month:
-            availability[month_key] = available_in_month
-            print(f"  -> {len(available_in_month)} available date(s): {available_in_month[:5]}")
-        else:
-            print(f"  -> No available dates (or calendar not loaded)")
-
-    return availability
+    # A day cell looks like:
+    #   <div class="day ... [greyedout] ...">
+    #     <div class="date">15</div>
+    #     <div class="available-main">
+    #       <div class="available-sub">2</div>   <-- units available
+    #     </div>
+    #   </div>
+    # Available = available-sub text is a positive integer.
+    available = await page.evaluate("""
+        () => {
+            const out = [];
+            document.querySelectorAll('.schedular-table .day').forEach(d => {
+                const dayText = d.querySelector('.date')?.innerText.trim();
+                const availText = d.querySelector('.available-sub')?.innerText.trim();
+                if (!dayText) return;
+                const n = parseInt(availText || '0', 10);
+                if (!Number.isNaN(n) && n > 0) out.push({ day: dayText, units: n });
+            });
+            return out;
+        }
+    """)
+    # Format as "DD (N units)" so notifications include the unit count
+    return [f"{d['day']} ({d['units']} units)" for d in available]
 
 
 async def run_check() -> None:
     previous = load_state()
     current: dict[str, list[str]] = {}
 
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[tracker] Using browser profile at: {PROFILE_DIR}")
+
     async with async_playwright() as pw:
-        # --no-sandbox is required in GitHub Actions / most CI environments
-        ci_args = ["--no-sandbox", "--disable-setuid-sandbox"] if os.getenv("CI") else []
-        browser = await pw.chromium.launch(headless=HEADLESS, args=ci_args)
-        context = await browser.new_context(
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            channel="chrome",   # use installed Google Chrome — better at passing Cloudflare
+            headless=HEADLESS,
             viewport={"width": 1280, "height": 900},
             user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
+            args=["--disable-blink-features=AutomationControlled"],
         )
-        page = await context.new_page()
+        page = context.pages[0] if context.pages else await context.new_page()
 
         try:
-            current = await fetch_availability(page)
-        except Exception as exc:
-            print(f"[error] Scrape failed: {exc}")
+            today = date.today()
+            for month_offset in range(MONTHS_TO_CHECK):
+                target = today.replace(day=1) + relativedelta(months=month_offset)
+                lookup = target if target > today else today
+                month_key = target.strftime("%Y-%m")
+                print(f"[scraper] Checking {target:%B %Y} ...")
+                try:
+                    days = await fetch_month(page, lookup)
+                except Exception as exc:
+                    print(f"  ! error: {exc}")
+                    continue
+                if days:
+                    current[month_key] = days
+                    print(f"  -> {len(days)} available: {days[:10]}")
+                else:
+                    print("  -> none available")
         finally:
-            await browser.close()
+            await context.close()
 
-    # ── Diff: find newly available slots ──────────────────────────────────────
     new_slots: dict[str, list[str]] = {}
-    for month, dates in current.items():
-        prev_dates = set(previous.get(month, []))
-        fresh = [d for d in dates if d not in prev_dates]
+    for month, days in current.items():
+        prev = set(previous.get(month, []))
+        fresh = [d for d in days if d not in prev]
         if fresh:
             new_slots[month] = fresh
 
-    if new_slots:
-        print(f"\n[tracker] NEW slots found: {new_slots}")
+    if FORCE_NOTIFY:
+        print(f"\n[tracker] FORCE_NOTIFY=true -- sending test notification for current state")
+        send_notifications(current or {"test": ["FORCE_NOTIFY firing - no slots currently visible"]})
+    elif STATUS_NOTIFY:
+        if new_slots:
+            print(f"\n[tracker] NEW slots: {new_slots}")
+        else:
+            print(f"\n[tracker] No new slots. Scanned {len(current)} month(s) with availability.")
+        send_status(current, new_slots)
+    elif new_slots:
+        print(f"\n[tracker] NEW slots: {new_slots}")
         send_notifications(new_slots)
     else:
-        print(f"\n[tracker] No new slots. Checked {len(current)} month(s).")
+        print(f"\n[tracker] No new slots. Scanned {len(current)} month(s) with availability.")
         if not current:
-            print("[tracker] Warning: no availability data was scraped - selectors may need updating.")
+            print("[tracker] WARNING: zero months returned data. Selectors may need tuning, "
+                  "or Cloudflare blocked us -- try HEADLESS=false once.")
 
-    # Merge and save (keep months even when no availability, to track drops too)
-    merged = {**previous, **current}
-    save_state(merged)
-    print(f"[tracker] State saved to {STATE_FILE}")
+    save_state({**previous, **current})
+    print(f"[tracker] State saved to {STATE_FILE.absolute()}")
 
 
 if __name__ == "__main__":
-    print(f"[tracker] SANParks Otter Trail checker - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[tracker] SANParks Otter Trail checker - {datetime.now():%Y-%m-%d %H:%M:%S}")
     asyncio.run(run_check())
