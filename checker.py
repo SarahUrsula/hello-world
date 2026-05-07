@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import smtplib
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, date
@@ -39,6 +40,13 @@ MONTHS_TO_CHECK  = int(os.getenv("MONTHS_TO_CHECK") or "11")
 HEADLESS         = os.getenv("HEADLESS", "true").lower() == "true"
 STATE_FILE       = Path(os.getenv("STATE_FILE", "state.json"))
 PROFILE_DIR      = Path(os.getenv("PROFILE_DIR", "browser_profile")).absolute()
+# When true, fires a notification on every run regardless of state diff.
+# Use for testing notification setup; switch back to false for normal use.
+FORCE_NOTIFY     = os.getenv("FORCE_NOTIFY", "false").lower() == "true"
+# When true, sends a status message on every run showing current availability,
+# even if nothing changed. Use during testing to confirm the checker is working.
+# Set to false for normal use (only notify when slots change up or down).
+STATUS_NOTIFY    = os.getenv("STATUS_NOTIFY", "false").lower() == "true"
 
 EMAIL_ENABLED    = os.getenv("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_FROM       = os.getenv("EMAIL_FROM", "")
@@ -124,10 +132,14 @@ def notify_telegram(text: str) -> None:
     )
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
-            if resp.status != 200:
-                print(f"[notify] Telegram HTTP {resp.status}")
-            else:
-                print("[notify] Telegram message sent")
+            print(f"[notify] Telegram HTTP {resp.status}: message sent")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:300]
+        print(f"[notify] Telegram HTTP {exc.code}: {body}")
+        if "chat not found" in body.lower():
+            print("[notify]   -> open Telegram, search for your bot, send /start to it, then retry")
+        elif "unauthorized" in body.lower():
+            print("[notify]   -> TELEGRAM_BOT_TOKEN is wrong (re-check from @BotFather)")
     except Exception as exc:
         print(f"[notify] Telegram failed: {exc}")
 
@@ -143,6 +155,36 @@ def send_notifications(new_slots: dict[str, list[str]]) -> None:
     print(message)
     notify_windows_toast("Otter Trail Available!", "\n".join(lines[1:5]))
     notify_email("Otter Trail slots available!", message)
+    notify_telegram(message)
+
+def send_status(current: dict[str, list[str]], new_slots: dict[str, list[str]]) -> None:
+    """Send a status update showing current availability; used when STATUS_NOTIFY=true."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if new_slots:
+        lines = [f"[{ts}] NEW slots opened on SANParks Otter Trail!\n"]
+        for month, dates in sorted(new_slots.items()):
+            lines.append(f"  {month} (NEW):")
+            for d in sorted(dates):
+                lines.append(f"    + {d}")
+    else:
+        lines = [f"[{ts}] Otter Trail check — no changes.\n"]
+
+    if current:
+        lines.append("\nCurrent availability:")
+        for month, dates in sorted(current.items()):
+            lines.append(f"  {month}:")
+            for d in sorted(dates):
+                lines.append(f"    - {d}")
+    else:
+        lines.append("\nNo slots currently available.")
+
+    lines.append("\nhttps://www.sanparks.org/reservations")
+    message = "\n".join(lines)
+
+    print(message)
+    if new_slots:
+        notify_windows_toast("Otter Trail Available!", "\n".join(lines[1:5]))
+        notify_email("Otter Trail slots available!", message)
     notify_telegram(message)
 
 # ── Cloudflare detection ──────────────────────────────────────────────────────
@@ -263,7 +305,16 @@ async def run_check() -> None:
         if fresh:
             new_slots[month] = fresh
 
-    if new_slots:
+    if FORCE_NOTIFY:
+        print(f"\n[tracker] FORCE_NOTIFY=true -- sending test notification for current state")
+        send_notifications(current or {"test": ["FORCE_NOTIFY firing - no slots currently visible"]})
+    elif STATUS_NOTIFY:
+        if new_slots:
+            print(f"\n[tracker] NEW slots: {new_slots}")
+        else:
+            print(f"\n[tracker] No new slots. Scanned {len(current)} month(s) with availability.")
+        send_status(current, new_slots)
+    elif new_slots:
         print(f"\n[tracker] NEW slots: {new_slots}")
         send_notifications(new_slots)
     else:

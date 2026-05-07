@@ -41,8 +41,15 @@ From an **elevated** PowerShell:
 powershell -ExecutionPolicy Bypass -File schedule_task.ps1
 ```
 
-This registers a task called **"Otter Trail Checker"** that runs
-`run_checker.bat` every 10 minutes for as long as your machine is awake.
+This registers a task called **"Otter Trail Checker"** with a targeted daily
+schedule — dense in the morning window (when SANParks typically releases new
+slots) and a couple of afternoon checks:
+
+| Time | Reason |
+|------|--------|
+| 08:00, 08:15, 08:30, 08:45, 09:00, 09:15 | Morning release window |
+| 13:00, 17:00 | Afternoon spot-checks |
+
 Logs go to `checker.log`.
 
 To remove later: `Unregister-ScheduledTask -TaskName "Otter Trail Checker" -Confirm:$false`
@@ -63,6 +70,7 @@ To remove later: `Unregister-ScheduledTask -TaskName "Otter Trail Checker" -Conf
 | `HEADLESS` | `true` | `false` shows the Chrome window |
 | `STATE_FILE` | `state.json` | Where known availability is persisted |
 | `PROFILE_DIR` | `browser_profile` | Chrome user-data-dir (cookies live here) |
+| `STATUS_NOTIFY` | `false` | `true` sends a Telegram status on every run (testing mode); `false` only notifies when slots change |
 
 ## Troubleshooting
 
